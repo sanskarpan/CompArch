@@ -10,6 +10,12 @@ States:
 - Shared (S): Cache line is clean and may be in other caches
 - Invalid (I): Cache line is not valid
 
+Deadlock prevention:
+  Operations release their per-cache lock before broadcasting on the bus.
+  The bus serialises all transactions with its own mutex so that no two
+  cores can be simultaneously inside SendMessage – eliminating the classic
+  "A waits for B while B waits for A" deadlock.
+
 Applications:
 - Multi-core processor cache coherence
 - Understanding shared memory consistency
@@ -94,20 +100,28 @@ type CoherentCacheLine struct {
 // Coherent Cache
 // =============================================================================
 
-// CoherentCache represents a cache with coherence protocol
+// CoherentCache represents a cache with MESI coherence protocol.
+//
+// Lock ordering to prevent deadlocks:
+//   1. CoherenceBus.mu  (outer, held only briefly during SendMessage)
+//   2. CoherentCache.mu (inner)
+//
+// CoherentCache.Read / Write always release their own lock before calling
+// CoherenceBus.SendMessage, so the bus's callbacks to HandleBusMessage can
+// safely acquire other caches' locks without circular waiting.
 type CoherentCache struct {
 	ID       int
 	Lines    map[uint64]*CoherentCacheLine
 	LineSize uint64
 	Bus      *CoherenceBus
-	mu       sync.RWMutex
+	mu       sync.Mutex // protects Lines and stats
 
 	// Statistics
-	Reads            uint64
-	Writes           uint64
-	Invalidations    uint64
-	Downgrades       uint64
-	BusTransactions  uint64
+	Reads           uint64
+	Writes          uint64
+	Invalidations   uint64
+	Downgrades      uint64
+	BusTransactions uint64
 }
 
 // NewCoherentCache creates a new coherent cache
@@ -120,148 +134,195 @@ func NewCoherentCache(id int, lineSize uint64, bus *CoherenceBus) *CoherentCache
 	}
 }
 
-// Read reads data from address
+// Read reads data from address.
+//
+// The per-cache lock is released before any bus transaction to prevent the
+// classic two-cache deadlock (A holds A.mu, waits for B.mu; B holds B.mu,
+// waits for A.mu).  After the bus transaction the lock is re-acquired and
+// state is checked again (double-checked pattern).
 func (c *CoherentCache) Read(addr uint64) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.Reads++
 	lineAddr := addr / c.LineSize
 
+	// --- Fast path: cache hit ---
+	c.mu.Lock()
+	c.Reads++
 	line, exists := c.Lines[lineAddr]
-
-	// Cache hit in M, E, or S state
 	if exists && line.Valid && line.State != Invalid {
-		return line.Data, true
+		data := make([]byte, len(line.Data))
+		copy(data, line.Data)
+		c.mu.Unlock()
+		return data, true
 	}
-
-	// Cache miss or invalid - need to request from bus
 	c.BusTransactions++
+	c.mu.Unlock() // Release BEFORE bus transaction to avoid deadlock
+
+	// --- Slow path: cache miss – fetch via bus ---
 	msg := CoherenceMessage{
 		Type:    MsgRead,
 		Address: lineAddr,
 		CoreID:  c.ID,
 	}
-
-	// Send read request on bus
 	responses := c.Bus.SendMessage(msg)
 
-	// Check if any cache has the line in M state
-	var data []byte
+	var fetchedData []byte
 	sharedCopy := false
-
 	for _, resp := range responses {
 		if resp.Type == MsgDataResponse {
-			data = resp.Data
+			fetchedData = resp.Data
 			sharedCopy = true
 		}
 	}
-
-	// If no cache provided data, fetch from memory
-	if data == nil {
-		data = c.Bus.ReadMemory(lineAddr)
+	if fetchedData == nil {
+		fetchedData = c.Bus.ReadMemory(lineAddr, c.LineSize)
 	}
 
-	// Allocate line in appropriate state
-	line = &CoherentCacheLine{
+	// --- Re-acquire lock to install the line ---
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Re-check: another goroutine might have already filled this line
+	line, exists = c.Lines[lineAddr]
+	if exists && line.Valid && line.State != Invalid {
+		data := make([]byte, len(line.Data))
+		copy(data, line.Data)
+		return data, true
+	}
+
+	newLine := &CoherentCacheLine{
 		Valid: true,
 		Tag:   lineAddr,
 		Data:  make([]byte, c.LineSize),
 	}
-	copy(line.Data, data)
-
+	// Pad fetchedData to full line size
+	copy(newLine.Data, fetchedData)
 	if sharedCopy {
-		line.State = Shared
+		newLine.State = Shared
 	} else {
-		line.State = Exclusive
+		newLine.State = Exclusive
 	}
+	c.Lines[lineAddr] = newLine
 
-	c.Lines[lineAddr] = line
-	return line.Data, false
+	result := make([]byte, len(newLine.Data))
+	copy(result, newLine.Data)
+	return result, false
 }
 
-// Write writes data to address
+// Write writes data to address.
+// Same lock-release-before-bus pattern as Read.
 func (c *CoherentCache) Write(addr uint64, data []byte) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.Writes++
 	lineAddr := addr / c.LineSize
 
+	// --- Fast path: line present with write permission ---
+	c.mu.Lock()
+	c.Writes++
 	line, exists := c.Lines[lineAddr]
 
 	if exists && line.Valid {
 		switch line.State {
 		case Modified:
-			// Already have exclusive ownership
-			copy(line.Data, data)
+			// Already have exclusive-dirty ownership
+			if len(data) <= len(line.Data) {
+				copy(line.Data, data)
+			}
+			c.mu.Unlock()
 			return true
 
 		case Exclusive:
-			// Transition to Modified
+			// Upgrade to Modified (no bus transaction needed)
 			line.State = Modified
-			copy(line.Data, data)
+			if len(data) <= len(line.Data) {
+				copy(line.Data, data)
+			}
+			c.mu.Unlock()
 			return true
 
 		case Shared:
-			// Need to upgrade to Modified - invalidate other copies
+			// Need upgrade: invalidate other copies via bus
 			c.BusTransactions++
 			c.Downgrades++
-			msg := CoherenceMessage{
+			c.mu.Unlock() // Release BEFORE bus
+
+			upgradeMsg := CoherenceMessage{
 				Type:    MsgUpgrade,
 				Address: lineAddr,
 				CoreID:  c.ID,
 			}
-			c.Bus.SendMessage(msg)
-			line.State = Modified
-			copy(line.Data, data)
-			return true
+			c.Bus.SendMessage(upgradeMsg)
 
-		case Invalid:
-			// Fall through to cache miss
+			c.mu.Lock()
+			// Re-check the line still exists after lock release
+			line, exists = c.Lines[lineAddr]
+			if exists && line.Valid {
+				line.State = Modified
+				if len(data) <= len(line.Data) {
+					copy(line.Data, data)
+				}
+				c.mu.Unlock()
+				return true
+			}
+			c.mu.Unlock()
+			// Fall through to miss path if evicted by another core
 		}
+	} else {
+		c.mu.Unlock()
 	}
 
-	// Cache miss - need read exclusive
+	// --- Slow path: cache miss – read-exclusive via bus ---
+	c.mu.Lock()
 	c.BusTransactions++
-	msg := CoherenceMessage{
+	c.mu.Unlock()
+
+	missMsg := CoherenceMessage{
 		Type:    MsgReadX,
 		Address: lineAddr,
 		CoreID:  c.ID,
 	}
+	responses := c.Bus.SendMessage(missMsg)
 
-	responses := c.Bus.SendMessage(msg)
-
-	// Get data if available
 	var lineData []byte
 	for _, resp := range responses {
 		if resp.Type == MsgDataResponse {
 			lineData = resp.Data
 		}
 	}
-
 	if lineData == nil {
-		lineData = c.Bus.ReadMemory(lineAddr)
+		lineData = c.Bus.ReadMemory(lineAddr, c.LineSize)
 	}
 
-	// Allocate line in Modified state
-	line = &CoherentCacheLine{
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Re-check
+	line, exists = c.Lines[lineAddr]
+	if exists && line.Valid && line.State == Modified {
+		// Another goroutine raced us and already got ownership
+		if len(data) <= len(line.Data) {
+			copy(line.Data, data)
+		}
+		return true
+	}
+
+	newLine := &CoherentCacheLine{
 		Valid: true,
 		Tag:   lineAddr,
 		State: Modified,
 		Data:  make([]byte, c.LineSize),
 	}
-	copy(line.Data, data)
-	c.Lines[lineAddr] = line
-
+	copy(newLine.Data, lineData)
+	// Write the new data on top
+	if len(data) <= len(newLine.Data) {
+		copy(newLine.Data, data)
+	}
+	c.Lines[lineAddr] = newLine
 	return false
 }
 
-// HandleBusMessage handles coherence messages from the bus
+// HandleBusMessage handles coherence messages from the bus for other cores.
+// Called by CoherenceBus.SendMessage (the bus serialises calls, so no two
+// HandleBusMessage calls for the same cache run concurrently).
 func (c *CoherentCache) HandleBusMessage(msg CoherenceMessage) *CoherenceMessage {
-	// Don't respond to own messages
 	if msg.CoreID == c.ID {
-		return nil
+		return nil // Ignore own messages
 	}
 
 	c.mu.Lock()
@@ -274,57 +335,53 @@ func (c *CoherentCache) HandleBusMessage(msg CoherenceMessage) *CoherenceMessage
 
 	switch msg.Type {
 	case MsgRead:
-		// Another cache is reading
 		switch line.State {
 		case Modified:
-			// Provide data and downgrade to Shared
+			// Provide data and downgrade to Shared; write back to memory
 			c.Downgrades++
-			response := &CoherenceMessage{
+			resp := &CoherenceMessage{
 				Type:    MsgDataResponse,
 				Address: msg.Address,
 				CoreID:  c.ID,
 				Data:    make([]byte, len(line.Data)),
 			}
-			copy(response.Data, line.Data)
+			copy(resp.Data, line.Data)
+			c.Bus.WriteMemory(msg.Address, line.Data) // writeback
 			line.State = Shared
-			return response
+			return resp
 
 		case Exclusive:
-			// Downgrade to Shared
 			c.Downgrades++
 			line.State = Shared
 			return nil
 
 		case Shared:
-			// Already shared, no action needed
-			return nil
+			return nil // Already shared; no action
 		}
 
 	case MsgReadX:
-		// Another cache is requesting exclusive access
 		switch line.State {
 		case Modified:
 			// Provide data and invalidate
 			c.Invalidations++
-			response := &CoherenceMessage{
+			resp := &CoherenceMessage{
 				Type:    MsgDataResponse,
 				Address: msg.Address,
 				CoreID:  c.ID,
 				Data:    make([]byte, len(line.Data)),
 			}
-			copy(response.Data, line.Data)
+			copy(resp.Data, line.Data)
+			c.Bus.WriteMemory(msg.Address, line.Data) // writeback
 			line.State = Invalid
-			return response
+			return resp
 
 		case Exclusive, Shared:
-			// Invalidate
 			c.Invalidations++
 			line.State = Invalid
 			return nil
 		}
 
 	case MsgUpgrade:
-		// Another cache is upgrading from Shared to Modified
 		if line.State == Shared {
 			c.Invalidations++
 			line.State = Invalid
@@ -332,7 +389,6 @@ func (c *CoherentCache) HandleBusMessage(msg CoherenceMessage) *CoherenceMessage
 		return nil
 
 	case MsgInvalidate:
-		// Explicit invalidation
 		c.Invalidations++
 		line.State = Invalid
 		return nil
@@ -341,7 +397,7 @@ func (c *CoherentCache) HandleBusMessage(msg CoherenceMessage) *CoherenceMessage
 	return nil
 }
 
-// Flush flushes dirty lines to memory
+// Flush writes all Modified lines back to memory and marks them Exclusive (clean).
 func (c *CoherentCache) Flush() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -349,15 +405,15 @@ func (c *CoherentCache) Flush() {
 	for addr, line := range c.Lines {
 		if line.State == Modified {
 			c.Bus.WriteMemory(addr, line.Data)
-			line.State = Exclusive
+			line.State = Exclusive // clean but still in this cache
 		}
 	}
 }
 
 // GetStats returns cache coherence statistics
 func (c *CoherentCache) GetStats() CoherenceStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	return CoherenceStats{
 		Reads:           c.Reads,
@@ -380,10 +436,10 @@ type CoherenceStats struct {
 // String returns a string representation of the stats
 func (s CoherenceStats) String() string {
 	return fmt.Sprintf(`Coherence Statistics:
-  Reads: %d
-  Writes: %d
-  Invalidations: %d
-  Downgrades: %d
+  Reads:            %d
+  Writes:           %d
+  Invalidations:    %d
+  Downgrades:       %d
   Bus Transactions: %d`,
 		s.Reads,
 		s.Writes,
@@ -396,11 +452,13 @@ func (s CoherenceStats) String() string {
 // Coherence Bus
 // =============================================================================
 
-// CoherenceBus represents the system bus for coherence traffic
+// CoherenceBus represents the system bus for coherence traffic.
+// Its mutex serialises all bus transactions so that only one
+// SendMessage call proceeds at a time, preventing cache–cache deadlocks.
 type CoherenceBus struct {
-	Caches  []*CoherentCache
-	Memory  map[uint64][]byte
-	mu      sync.Mutex
+	Caches []*CoherentCache
+	Memory map[uint64][]byte
+	mu     sync.Mutex
 
 	// Statistics
 	Transactions uint64
@@ -421,34 +479,36 @@ func (b *CoherenceBus) RegisterCache(cache *CoherentCache) {
 	b.Caches = append(b.Caches, cache)
 }
 
-// SendMessage broadcasts a message to all caches
+// SendMessage serialises and broadcasts a coherence message to all other caches.
+// Callers must NOT hold their own cache lock when calling this method.
 func (b *CoherenceBus) SendMessage(msg CoherenceMessage) []*CoherenceMessage {
+	// Serialise bus transactions to prevent concurrent SendMessage calls
+	// from creating A→B / B→A lock cycles inside HandleBusMessage.
 	b.mu.Lock()
 	b.Transactions++
 	b.Broadcasts++
+	caches := make([]*CoherentCache, len(b.Caches)) // snapshot under lock
+	copy(caches, b.Caches)
 	b.mu.Unlock()
 
 	var responses []*CoherenceMessage
-
-	for _, cache := range b.Caches {
+	for _, cache := range caches {
 		if resp := cache.HandleBusMessage(msg); resp != nil {
 			responses = append(responses, resp)
 		}
 	}
-
 	return responses
 }
 
-// ReadMemory reads from main memory
-func (b *CoherenceBus) ReadMemory(addr uint64) []byte {
+// ReadMemory reads lineSize bytes from main memory at the given line address.
+func (b *CoherenceBus) ReadMemory(lineAddr uint64, lineSize uint64) []byte {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	data, exists := b.Memory[addr]
+	data, exists := b.Memory[lineAddr]
 	if !exists {
-		// Allocate and zero initialize
-		data = make([]byte, 64) // Default cache line size
-		b.Memory[addr] = data
+		data = make([]byte, lineSize)
+		b.Memory[lineAddr] = data
 	}
 
 	result := make([]byte, len(data))
@@ -456,13 +516,14 @@ func (b *CoherenceBus) ReadMemory(addr uint64) []byte {
 	return result
 }
 
-// WriteMemory writes to main memory
-func (b *CoherenceBus) WriteMemory(addr uint64, data []byte) {
+// WriteMemory writes data to main memory at the given line address.
+func (b *CoherenceBus) WriteMemory(lineAddr uint64, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.Memory[addr] = make([]byte, len(data))
-	copy(b.Memory[addr], data)
+	stored := make([]byte, len(data))
+	copy(stored, data)
+	b.Memory[lineAddr] = stored
 }
 
 // GetStats returns bus statistics
@@ -488,8 +549,8 @@ type BusStats struct {
 
 // CoherentSystem represents a multi-core system with cache coherence
 type CoherentSystem struct {
-	Bus    *CoherenceBus
-	Caches []*CoherentCache
+	Bus      *CoherenceBus
+	Caches   []*CoherentCache
 	NumCores int
 }
 
@@ -526,15 +587,12 @@ func (s *CoherentSystem) Write(coreID int, addr uint64, data []byte) {
 	}
 }
 
-// GetAllStats returns statistics for all cores
+// GetAllStats returns statistics for all cores and the bus
 func (s *CoherentSystem) GetAllStats() map[string]interface{} {
 	stats := make(map[string]interface{})
-
 	for i, cache := range s.Caches {
 		stats[fmt.Sprintf("Core%d", i)] = cache.GetStats()
 	}
-
 	stats["Bus"] = s.Bus.GetStats()
-
 	return stats
 }
