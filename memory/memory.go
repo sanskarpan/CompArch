@@ -194,10 +194,11 @@ func NewMemorySystem(ramType RAMType, sizeGB uint64) *MemorySystem {
 	}
 }
 
-// Read reads data from memory
+// Read reads data from memory.
+// Uses a full write lock because it updates statistics (Reads, BytesRead, TotalLatency).
 func (m *MemorySystem) Read(addr uint64, size int) []byte {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	m.Reads++
 	m.BytesRead += uint64(size)
@@ -243,13 +244,17 @@ func (m *MemorySystem) GetStats() MemoryStats {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	avgLatency := float64(0)
+	if total := m.Reads + m.Writes; total > 0 {
+		avgLatency = float64(m.TotalLatency) / float64(total)
+	}
 	return MemoryStats{
 		Reads:        m.Reads,
 		Writes:       m.Writes,
 		BytesRead:    m.BytesRead,
 		BytesWritten: m.BytesWritten,
 		TotalLatency: m.TotalLatency,
-		AvgLatency:   float64(m.TotalLatency) / float64(m.Reads+m.Writes),
+		AvgLatency:   avgLatency,
 	}
 }
 
