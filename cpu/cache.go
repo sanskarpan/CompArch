@@ -275,9 +275,13 @@ func (c *Cache) Read(addr uint64, size int) ([]byte, bool) {
 			c.Hits++
 			c.Config.Policy.OnAccess(set, way)
 
-			// Return data
+			// Return data (bounds-checked)
 			data := make([]byte, size)
-			copy(data, line.Data[offset:offset+uint64(size)])
+			end := offset + uint64(size)
+			if end > uint64(len(line.Data)) {
+				end = uint64(len(line.Data))
+			}
+			copy(data, line.Data[offset:end])
 			return data, true
 		}
 	}
@@ -313,7 +317,11 @@ func (c *Cache) Read(addr uint64, size int) ([]byte, bool) {
 	c.Config.Policy.OnAccess(set, victim)
 
 	result := make([]byte, size)
-	copy(result, line.Data[offset:offset+uint64(size)])
+	end := offset + uint64(size)
+	if end > uint64(len(line.Data)) {
+		end = uint64(len(line.Data))
+	}
+	copy(result, line.Data[offset:end])
 	return result, false
 }
 
