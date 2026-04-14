@@ -199,9 +199,19 @@ type Cache struct {
 	mu         sync.RWMutex
 }
 
-// NewCache creates a new cache
+// NewCache creates a new cache.
+// Panics if configuration values are zero or produce zero sets.
 func NewCache(config CacheConfig) *Cache {
+	if config.LineSize == 0 || config.Associativity == 0 {
+		panic("cache: LineSize and Associativity must be > 0")
+	}
+	if config.Policy == nil {
+		config.Policy = &LRUPolicy{}
+	}
 	numSets := config.Size / (config.LineSize * config.Associativity)
+	if numSets == 0 {
+		numSets = 1 // minimum 1 set (fully-associative degenerate case)
+	}
 
 	cache := &Cache{
 		Config:  config,
@@ -390,7 +400,11 @@ func (c *Cache) Flush() {
 func (c *Cache) GetHitRate() float64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.hitRateLocked()
+}
 
+// hitRateLocked computes hit rate without acquiring the lock (caller must hold at least RLock).
+func (c *Cache) hitRateLocked() float64 {
 	total := c.Hits + c.Misses
 	if total == 0 {
 		return 0
@@ -398,18 +412,20 @@ func (c *Cache) GetHitRate() float64 {
 	return float64(c.Hits) / float64(total)
 }
 
-// GetStats returns cache statistics
+// GetStats returns cache statistics.
+// Computes all fields under a single lock acquisition to avoid reentrant-lock issues.
 func (c *Cache) GetStats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	total := c.Hits + c.Misses
+	hitRate := c.hitRateLocked()
 	return CacheStats{
 		Hits:       c.Hits,
 		Misses:     c.Misses,
 		Accesses:   total,
-		HitRate:    c.GetHitRate(),
-		MissRate:   1.0 - c.GetHitRate(),
+		HitRate:    hitRate,
+		MissRate:   1.0 - hitRate,
 		Writes:     c.Writes,
 		Writebacks: c.Writebacks,
 	}
