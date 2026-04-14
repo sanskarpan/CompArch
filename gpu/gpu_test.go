@@ -147,7 +147,7 @@ func TestThreadGlobalID(t *testing.T) {
 		BlockIDX:  2,
 	}
 
-	globalID := thread.GetGlobalID()
+	globalID := thread.GetGlobalID(256)
 	expected := 2*256 + 10 // blockID * blockSize + threadID
 
 	if globalID != expected {
