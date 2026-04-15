@@ -64,11 +64,12 @@ type Pipeline struct {
 	WB  PipelineStage // Writeback
 
 	// CPU state
-	Registers  [NumRegisters]int32
-	Memory     []byte
-	PC         uint32
-	Halted     bool
-	CycleCount uint64
+	Registers    [NumRegisters]int32
+	Memory       []byte
+	PC           uint32
+	Halted       bool   // true when pipeline is fully drained and stopped
+	FetchHalted  bool   // true when HALT has been fetched; no more instructions issued
+	CycleCount   uint64
 
 	// Hazard detection counters
 	StallCount   uint64
@@ -105,6 +106,7 @@ func (p *Pipeline) Reset() {
 	}
 	p.PC = 0
 	p.Halted = false
+	p.FetchHalted = false
 	p.CycleCount = 0
 	p.StallCount = 0
 	p.ForwardCount = 0
@@ -390,7 +392,9 @@ func (p *Pipeline) StageID() {
 	p.ID.Rs1Value = p.Registers[inst.Rs1]
 	p.ID.Rs2Value = p.Registers[inst.Rs2]
 
-	// Capture STORE data value at decode time (avoids reading registers in MEM stage)
+	// Capture STORE data value at decode time.
+	// Must be patched up with forwarding below because the producing instruction
+	// may still be in-flight (MEM or WB stage) when STORE is in ID.
 	if inst.OpCode == OpSTORE {
 		p.ID.StoreData = p.Registers[inst.Rd]
 	}
@@ -407,8 +411,25 @@ func (p *Pipeline) StageID() {
 		inst.OpCode == OpBLT || inst.OpCode == OpBGT ||
 		inst.OpCode == OpJMP || inst.OpCode == OpCALL || inst.OpCode == OpRET)
 
-	// Apply data forwarding before advancing to EX
+	// Apply data forwarding (updates Rs1Value / Rs2Value)
 	p.ForwardData()
+
+	// Forward the STORE data value (Rd field) from MEM/WB if it is still in-flight.
+	// ForwardData only patches Rs1/Rs2; STORE's source value lives in Rd.
+	if inst.OpCode == OpSTORE {
+		if p.MEM.Valid && p.MEM.RegWrite && p.MEM.Instruction != nil &&
+			p.MEM.Instruction.Rd == inst.Rd {
+			p.ID.StoreData = p.MEM.ALUResult
+		}
+		if p.WB.Valid && p.WB.RegWrite && p.WB.Instruction != nil &&
+			p.WB.Instruction.Rd == inst.Rd {
+			if p.WB.MemRead {
+				p.ID.StoreData = p.WB.MemData
+			} else {
+				p.ID.StoreData = p.WB.ALUResult
+			}
+		}
+	}
 
 	// Advance to EX
 	p.EX = p.ID
@@ -416,8 +437,12 @@ func (p *Pipeline) StageID() {
 
 // StageIF executes the Fetch stage.
 // Fetches the instruction at the current PC, decodes it, and places it in ID.
+// When a HALT instruction is encountered, fetch is stopped (FetchHalted=true)
+// and a bubble (empty stage) is injected into ID so the pipeline drains naturally.
 func (p *Pipeline) StageIF() {
-	if p.Halted {
+	if p.Halted || p.FetchHalted {
+		// Inject bubble — nothing new enters the pipeline.
+		p.ID = PipelineStage{}
 		return
 	}
 
@@ -434,7 +459,8 @@ func (p *Pipeline) StageIF() {
 	inst := DecodeInstruction(word)
 
 	if inst.OpCode == OpHALT {
-		p.Halted = true
+		p.FetchHalted = true
+		p.ID = PipelineStage{} // inject bubble; let in-flight instructions drain
 		return
 	}
 
@@ -459,9 +485,11 @@ func (p *Pipeline) StageIF() {
 //  3. EX  – compute ALU, resolve branches, advance to MEM
 //  4. Hazard check – stall if load-use hazard (EX just placed a LOAD in MEM)
 //  5. ID  – decode, read registers, forward, advance to EX
-//  6. IF  – fetch next instruction into ID
+//  6. IF  – fetch next instruction into ID (or inject bubble after HALT)
 //
 // The key insight: WB/MEM/EX always advance; only ID/IF are frozen on a stall.
+// After HALT is fetched (FetchHalted=true), the pipeline keeps cycling until all
+// in-flight instructions have drained through WB, at which point Halted is set.
 func (p *Pipeline) Cycle() {
 	if p.Halted {
 		return
@@ -483,6 +511,13 @@ func (p *Pipeline) Cycle() {
 
 	p.StageID()
 	p.StageIF()
+
+	// After fetch is halted, check whether the pipeline has fully drained.
+	// All stage registers must be empty (Valid=false) before we stop.
+	if p.FetchHalted &&
+		!p.WB.Valid && !p.MEM.Valid && !p.EX.Valid && !p.ID.Valid {
+		p.Halted = true
+	}
 }
 
 // Run runs the pipeline until halted or max cycles reached
