@@ -392,15 +392,15 @@ func (c *Cache) Flush() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, set := range c.Sets {
-		set.Mutex.Lock()
-		for _, line := range set.Lines {
-			if line.Valid && line.Dirty {
+	for i := range c.Sets {
+		c.Sets[i].Mutex.Lock()
+		for j := range c.Sets[i].Lines {
+			if c.Sets[i].Lines[j].Valid && c.Sets[i].Lines[j].Dirty {
 				c.Writebacks++
-				line.Dirty = false
+				c.Sets[i].Lines[j].Dirty = false
 			}
 		}
-		set.Mutex.Unlock()
+		c.Sets[i].Mutex.Unlock()
 	}
 }
 
